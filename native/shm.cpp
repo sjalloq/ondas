@@ -739,7 +739,11 @@ struct Stream {
     std::unique_ptr<Session> session;
     std::vector<Declaration> declarations;
     std::vector<std::unique_ptr<Cursor>> cursors;
-    std::vector<size_t> heap;
+    // Merge heap of ready history heads, least record first. Keys are held
+    // inline so ordering does not load the histories. While `refill` names a
+    // history, the top entry is its delivered record and is stale.
+    struct Entry { std::uint64_t tick, id, sequence; size_t index; };
+    std::vector<Entry> heap;
     size_t refill = root_node;
     bool started = false, activated = false, first_batch = true;
     Record output{};
@@ -765,7 +769,38 @@ struct Stream {
     }
     void activate();
     ~Stream();
-    bool later(size_t a, size_t b) const { return before(histories[b].head, histories[a].head); }
+    static bool earlier_entry(const Entry &a, const Entry &b) {
+        if (a.tick != b.tick) return a.tick < b.tick;
+        if (a.id != b.id) return a.id < b.id;
+        return a.sequence < b.sequence;
+    }
+    Entry entry(size_t index) const {
+        const auto &head = histories[index].head;
+        return {head.tick, head.id, head.sequence, index};
+    }
+    void sift_down(size_t at) {
+        const auto count = heap.size();
+        const Entry moved = heap[at];
+        for (;;) {
+            auto child = 2 * at + 1;
+            if (child >= count) break;
+            if (child + 1 < count && earlier_entry(heap[child + 1], heap[child])) ++child;
+            if (!earlier_entry(heap[child], moved)) break;
+            heap[at] = heap[child];
+            at = child;
+        }
+        heap[at] = moved;
+    }
+    void sift_up(size_t at) {
+        const Entry moved = heap[at];
+        while (at) {
+            const auto parent = (at - 1) / 2;
+            if (!earlier_entry(moved, heap[parent])) break;
+            heap[at] = heap[parent];
+            at = parent;
+        }
+        heap[at] = moved;
+    }
     void fill(size_t index) {
         auto &h = histories[index];
         if (!h.done) {
@@ -778,10 +813,6 @@ struct Stream {
             } payload{head_payload, h.head, head_payload - h.head.data.capacity()};
             h.fill(declarations[index], *cursors[index], end, work,
                    [this, &payload](const Record *record) { payload.refresh(); account(record); });
-        }
-        if (h.ready) {
-            heap.push_back(index);
-            std::push_heap(heap.begin(), heap.end(), [this](size_t a, size_t b) { return later(a, b); });
         }
     }
     void account(const Record *transient = nullptr) {
@@ -796,13 +827,23 @@ struct Stream {
     const Record *next() {
         if (!started || (refill != root_node && !histories[refill].done)) activate();
         if (!started) {
-            for (size_t i = 0; i < histories.size(); ++i) fill(i);
+            for (size_t i = 0; i < histories.size(); ++i) {
+                fill(i);
+                if (histories[i].ready) { heap.push_back(entry(i)); sift_up(heap.size() - 1); }
+            }
             started = true;
         }
-        if (refill != root_node) { fill(refill); refill = root_node; }
+        if (refill != root_node) {
+            // Replace the stale top in place. A history's next record is often
+            // still the least, so this usually moves nothing.
+            fill(refill);
+            if (histories[refill].ready) heap.front() = entry(refill);
+            else { heap.front() = heap.back(); heap.pop_back(); }
+            if (!heap.empty()) sift_down(0);
+            refill = root_node;
+        }
         if (heap.empty()) return nullptr;
-        std::pop_heap(heap.begin(), heap.end(), [this](size_t a, size_t b) { return later(a, b); });
-        const auto index = heap.back(); heap.pop_back();
+        const auto index = heap.front().index;
         const auto old_capacity = histories[index].head.data.capacity();
         output = std::move(histories[index].head);
         histories[index].head = {};
