@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 
 thread_local! {
     static TICK_WORK: Cell<(usize, usize, usize)> = const { Cell::new((0, 0, 0)) };
+    static SCAN_WORK: Cell<usize> = const { Cell::new(0) };
 }
 
 pub(super) fn setup_visits(n: usize) {
@@ -16,6 +17,10 @@ pub(super) fn setup_visits(n: usize) {
 
 pub(super) fn comparison_visit() {
     TICK_WORK.with(|work| work.update(|(setup, compare, commit)| (setup, compare + 1, commit)));
+}
+
+pub(super) fn scan_visit() {
+    SCAN_WORK.with(|work| work.update(|count| count + 1));
 }
 
 pub(super) fn commit_visit() {
@@ -167,6 +172,85 @@ fn wlf_last_completed_tick_precedes_late_string_error() {
             assert_eq!(observed, expected);
         }
     }
+}
+
+#[test]
+fn scan_visits_only_selection_entries_of_active_slots() {
+    let width = 2000;
+    let ticks = 200;
+    let mut text = String::new();
+    for i in 0..width {
+        text.push_str(&format!("$var wire 1 v{i} n{i} $end "));
+    }
+    text.push_str("$enddefinitions $end #0 ");
+    for i in 0..width {
+        text.push_str(&format!("0v{i} "));
+    }
+    for tick in 1..=ticks {
+        text.push_str(&format!("#{tick} 1v{} ", (tick * 7) % width));
+    }
+    let mut wave =
+        crate::open_bytes_with("wide.vcd", text.into_bytes().into(), "vcd-native").unwrap();
+    let signals = (0..width)
+        .map(|i| wave.hierarchy().signal(&format!("n{i}")).unwrap())
+        .collect::<Vec<_>>();
+    let mut selection = wave.select(&signals).unwrap();
+    SCAN_WORK.with(|work| work.set(0));
+    let mut changes = 0;
+    let _ = selection
+        .scan_each(TimeRange::all(), |_, record| {
+            if let ScanRef::Change { .. } = record {
+                changes += 1;
+            }
+            ControlFlow::<()>::Continue(())
+        })
+        .unwrap();
+    // Tick 0 activates every slot; later ticks activate one slot each.
+    assert_eq!(changes, width + ticks);
+    assert_eq!(SCAN_WORK.with(Cell::get), width + ticks);
+}
+
+#[test]
+fn scan_emits_same_tick_changes_in_selection_order() {
+    let text = "$var wire 1 a x $end $var wire 1 b y $end $var event 1 e ev $end \
+        $enddefinitions $end #0 0a 0b #1 1b 1a 1e #2 0b 1e 0a";
+    let mut wave =
+        crate::open_bytes_with("order.vcd", text.as_bytes().to_vec().into(), "vcd-native").unwrap();
+    let hierarchy = wave.hierarchy();
+    let (x, y, ev) = (
+        hierarchy.signal("x").unwrap(),
+        hierarchy.signal("y").unwrap(),
+        hierarchy.signal("ev").unwrap(),
+    );
+    let mut selection = wave.select(&[ev, y, x, y, x.slice(0, 0).unwrap()]).unwrap();
+    let mut changes = Vec::new();
+    let _ = selection
+        .scan_each(TimeRange::all(), |index, record| {
+            if let ScanRef::Change { time, .. } = record {
+                changes.push((time.ticks(), index));
+            }
+            ControlFlow::<()>::Continue(())
+        })
+        .unwrap();
+    assert_eq!(
+        changes,
+        [
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (1, 3),
+            (1, 4),
+            (2, 0),
+            (2, 1),
+            (2, 2),
+            (2, 3),
+            (2, 4)
+        ]
+    );
 }
 
 #[test]

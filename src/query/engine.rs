@@ -217,24 +217,75 @@ fn initials<B>(
     ControlFlow::Continue(())
 }
 
+// Selection entries of each slot, so a tick visits only its active slots.
+struct SlotEntries {
+    offsets: Vec<usize>,
+    entries: Vec<usize>,
+}
+
+impl SlotEntries {
+    fn new(slot_indices: &[usize], slots: usize) -> Self {
+        let mut offsets = vec![0; slots + 1];
+        for &slot in slot_indices {
+            offsets[slot + 1] += 1;
+        }
+        for slot in 0..slots {
+            offsets[slot + 1] += offsets[slot];
+        }
+        let mut next = offsets.clone();
+        let mut entries = vec![0; slot_indices.len()];
+        for (index, &slot) in slot_indices.iter().enumerate() {
+            entries[next[slot]] = index;
+            next[slot] += 1;
+        }
+        Self { offsets, entries }
+    }
+
+    fn of(&self, slot: usize) -> &[usize] {
+        &self.entries[self.offsets[slot]..self.offsets[slot + 1]]
+    }
+}
+
+struct ScanTick<'a> {
+    slot_indices: &'a [usize],
+    slot_entries: SlotEntries,
+    range: TimeRange,
+    emitted_initials: bool,
+    // Reused per tick to avoid allocation.
+    ordered: Vec<usize>,
+}
+
 fn scan_tick<B>(
+    scan: &mut ScanTick<'_>,
     signals: &[Signal],
     slots: &[Slot],
-    slot_indices: &[usize],
+    active_slots: &[usize],
     time: Time,
-    range: TimeRange,
-    emitted_initials: &mut bool,
     visitor: &mut impl for<'v> FnMut(usize, ScanRef<'v>) -> ControlFlow<B>,
 ) -> ControlFlow<B> {
-    if !*emitted_initials && time >= range.start() {
-        *emitted_initials = true;
+    let (slot_indices, range) = (scan.slot_indices, scan.range);
+    if !scan.emitted_initials && time >= range.start() {
+        scan.emitted_initials = true;
         initials(signals, slots, slot_indices, visitor)?;
     }
-    for (index, &signal) in signals.iter().enumerate() {
+    if time < range.start() {
+        return ControlFlow::Continue(());
+    }
+    // Keep ascending selection order within the tick.
+    let ordered = &mut scan.ordered;
+    ordered.clear();
+    for &slot in active_slots {
+        ordered.extend_from_slice(scan.slot_entries.of(slot));
+    }
+    ordered.sort_unstable();
+    ordered.dedup();
+    for &index in ordered.iter() {
+        #[cfg(test)]
+        streaming_tests::scan_visit();
+        let signal = signals[index];
         let slot = &slots[slot_indices[index]];
         if let Some(value) = &slot.pending
             && slot.changed
-            && time >= range.start()
         {
             visitor(
                 index,
@@ -246,7 +297,7 @@ fn scan_tick<B>(
             )?;
         }
         let events = slot.events;
-        if time >= range.start() && events > 0 {
+        if events > 0 {
             visitor(
                 index,
                 ScanRef::Change {
@@ -271,7 +322,7 @@ fn complete_tick<B>(
     active_slots: &mut Vec<usize>,
     time: Time,
     visit_from: Option<Time>,
-    visitor: &mut impl FnMut(Time, &[Signal], &[Slot]) -> Result<ControlFlow<B>>,
+    visitor: &mut impl FnMut(Time, &[Signal], &[Slot], &[usize]) -> Result<ControlFlow<B>>,
 ) -> Result<ControlFlow<B>> {
     for computation in computations {
         computation.complete(slots, active_slots);
@@ -288,7 +339,7 @@ fn complete_tick<B>(
         });
     }
     if visit_from.is_none_or(|start| time >= start)
-        && let ControlFlow::Break(value) = visitor(time, signals, slots)?
+        && let ControlFlow::Break(value) = visitor(time, signals, slots, active_slots)?
     {
         return Ok(ControlFlow::Break(value));
     }
@@ -404,7 +455,7 @@ impl<'w> Selection<'w> {
         } else {
             None
         };
-        let _ = self.read_ticks_from(start, end, &mut slots, true, |time, signals, slots| {
+        let _ = self.read_ticks_from(start, end, &mut slots, true, |time, signals, slots, _| {
             while next < order.len() && times[order[next]] <= time {
                 let index = order[next];
                 rows[index].1 = observe(signals, slots, (times[index] == time).then_some(time));
@@ -604,7 +655,7 @@ impl<'w> Selection<'w> {
             end,
             &mut slots,
             true,
-            |time, signals, slots| {
+            |time, signals, slots, _| {
                 if time >= range.start()
                     && drivers.iter().any(|&index| {
                         let slot = &slots[slot_indices[index]];
@@ -1187,28 +1238,33 @@ impl<'w> Selection<'w> {
         let mut slots = (0..self.retained_signals.len())
             .map(|_| Slot::default())
             .collect::<Vec<_>>();
-        let mut emitted_initials = false;
         let slot_indices = self.slot_indices.clone();
+        let mut scan = ScanTick {
+            slot_indices: &slot_indices,
+            slot_entries: SlotEntries::new(&slot_indices, slots.len()),
+            range,
+            emitted_initials: false,
+            ordered: Vec::new(),
+        };
         if let ControlFlow::Break(value) = self.read_ticks_from(
             Some(range.start()),
             end,
             &mut slots,
             seed_point,
-            |time, signals, slots| {
+            |time, signals, slots, active_slots| {
                 Ok(scan_tick(
+                    &mut scan,
                     signals,
                     slots,
-                    &slot_indices,
+                    active_slots,
                     time,
-                    range,
-                    &mut emitted_initials,
                     &mut visitor,
                 ))
             },
         )? {
             return Ok(ControlFlow::Break(value));
         }
-        if !emitted_initials {
+        if !scan.emitted_initials {
             let replay = self.replay.take();
             let checkpoint = self.checkpoint.take();
             let result = initials(&self.signals, &slots, &slot_indices, &mut visitor);
@@ -1228,9 +1284,11 @@ impl<'w> Selection<'w> {
         &mut self,
         end: Time,
         slots: &mut [Slot],
-        visitor: impl FnMut(Time, &[Signal], &[Slot]) -> Result<ControlFlow<B>>,
+        mut visitor: impl FnMut(Time, &[Signal], &[Slot]) -> Result<ControlFlow<B>>,
     ) -> Result<ControlFlow<B>> {
-        self.read_ticks_from(None, end, slots, true, visitor)
+        self.read_ticks_from(None, end, slots, true, |time, signals, slots, _| {
+            visitor(time, signals, slots)
+        })
     }
 
     fn read_ticks_from<B>(
@@ -1239,7 +1297,7 @@ impl<'w> Selection<'w> {
         end: Time,
         slots: &mut [Slot],
         seed_point: bool,
-        mut visitor: impl FnMut(Time, &[Signal], &[Slot]) -> Result<ControlFlow<B>>,
+        mut visitor: impl FnMut(Time, &[Signal], &[Slot], &[usize]) -> Result<ControlFlow<B>>,
     ) -> Result<ControlFlow<B>> {
         let eligible =
             |replay: &Replay| start.is_some_and(|start| replay.start <= start) && replay.end <= end;
@@ -3889,7 +3947,7 @@ mod tests {
             &mut vec![0],
             Time::from_ticks(1),
             None,
-            &mut |_, _, slots| {
+            &mut |_, _, slots, _| {
                 assert!(matches!(
                     slots[0].state.as_ref().unwrap().value.as_ref(),
                     ValueRef::String("old")

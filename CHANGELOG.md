@@ -11,6 +11,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 ### Changed
 
 - Normalize confirmed VCD split declarations as one variable and signal. Preserve independent aliases and use ordinary composition semantics for values and slices. The normalized variable has no original HDL declaration range.
+- Speed up scans of large selections. Each tick visits only the selection entries of the signals that changed at that tick, not the full selection. Same-tick changes keep selection order.
 
 ## [2.1.0] - 2026-11-10
 
