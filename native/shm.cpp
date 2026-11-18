@@ -1208,10 +1208,13 @@ extern "C" int ondas_shm_read_direct(ondas_shm *reader, const uint64_t *ids, siz
             const auto &declaration = declarations[i];
             const bool event = declaration.descriptor.encoding == 4;
             started = Clock::now();
-            Cursor cursor(declaration.variable);
+            // Bit 2 of `seek`: create the iterator with the range end as its
+            // bound, to see whether the SDK then loads less of the dump.
+            const SstTime bound{end, UINT64_MAX};
+            Cursor cursor(declaration.variable, (seek & 2) ? &bound : nullptr);
             auto opened = Clock::now();
             out->cursor_seconds += seconds(started, opened);
-            if (seek && from > 0) {
+            if ((seek & 1) && from > 0) {
                 const auto sought = da_handle_pl(0x17f, cursor.handle, 0x126, SstTime{from - 1, UINT64_MAX}, 0x10);
                 if (sought > 1) check_handle(sought, "cannot seek SHM history");
                 require(sought == 0 || sought == 1, "invalid SHM seek result");

@@ -588,6 +588,7 @@ impl Reader {
         from: Time,
         end: Time,
         seek: bool,
+        bound: bool,
     ) -> Result<ShmDirectRead> {
         self.point_fallback = None;
         let ids: Vec<_> = signals.iter().map(|s| self.ids[s.index()]).collect();
@@ -605,7 +606,7 @@ impl Reader {
                     ids.len(),
                     from.ticks(),
                     end.ticks(),
-                    c_int::from(seek),
+                    c_int::from(seek) | (c_int::from(bound) << 1),
                     &mut out,
                     buffer.as_mut_ptr(),
                     buffer.len(),

@@ -97,7 +97,8 @@ typedef struct {
     uint64_t records, changes, payload, seek_misses;
     double setup_seconds, cursor_seconds, seek_seconds, read_seconds;
 } ondas_shm_direct;
-// With `seek`, each cursor first seeks to the last record before `from`.
+// `seek` bit 1: each cursor first seeks to the last record before `from`.
+// `seek` bit 2: each iterator is created with `end` as its bound.
 int ondas_shm_read_direct(ondas_shm *, const uint64_t *, size_t, uint64_t from, uint64_t end, int seek,
                           ondas_shm_direct *, char *, size_t, int *os_error);
 int ondas_shm_next(ondas_shm *, ondas_shm_record *, char *, size_t, int *os_error);
