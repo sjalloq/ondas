@@ -115,6 +115,20 @@ impl ValueRef<'_> {
         }
     }
 
+    /// Copies this borrowed value into owned storage, reusing the storage of
+    /// `spare` when it is a bit vector of the same width.
+    pub(crate) fn to_owned_reusing(self, spare: Option<Value>) -> Value {
+        if let (Self::Bits(bits), Some(Value::Bits(mut owned))) = (self, spare)
+            && owned.data.len() == bits.data.len()
+        {
+            for (to, from) in owned.data.iter_mut().zip(bits.data) {
+                *to = from.to_ascii_lowercase();
+            }
+            return Value::Bits(owned);
+        }
+        self.to_owned()
+    }
+
     /// Copies this borrowed value into owned storage.
     pub fn to_owned(self) -> Value {
         match self {

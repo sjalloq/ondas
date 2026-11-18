@@ -619,15 +619,22 @@ Record decode(const Declaration &declaration, Cursor &cursor, SstTime current, i
     Record record{d.id, current.tick, current.sequence, d.encoding, false, {}};
     require(state >= 0, "SHM history has an unavailable recording interval");
     if (d.encoding == 1) {
-        record.data = text(0x15a, cursor.handle);
-        require(record.data.size() == d.width, "SHM bit value width disagrees with declaration");
-        for (char &stored : record.data) {
-            if (stored == '0' || stored == '1') continue;
-            unsigned char bit = static_cast<unsigned char>(stored);
-            if (bit >= 'A' && bit <= 'Z') bit += 'a' - 'A';
-            require(std::strchr("01xzuwlh-", bit) && bit, "invalid SHM logic state");
-            stored = static_cast<char>(bit);
+        // The declared width bounds the text, so no length scan is needed. A
+        // short text ends in the loop at its NUL; a long one fails after it.
+        const char *raw = da_get_sstr(0x15a, cursor.handle);
+        const char *const width_error = "SHM bit value width disagrees with declaration";
+        require(raw != nullptr, width_error);
+        record.data.resize(d.width);
+        for (std::uint32_t i = 0; i < d.width; ++i) {
+            unsigned char bit = static_cast<unsigned char>(raw[i]);
+            require(bit != 0, width_error);
+            if (bit != '0' && bit != '1') {
+                if (bit >= 'A' && bit <= 'Z') bit += 'a' - 'A';
+                require(std::strchr("01xzuwlh-", bit) != nullptr, "invalid SHM logic state");
+            }
+            record.data[i] = static_cast<char>(bit);
         }
+        require(raw[d.width] == 0, width_error);
     } else if (d.encoding == 2) {
         double real = 0;
         require(da_get_real(0x107, cursor.handle, &real) >= 0, "cannot read SHM real value");

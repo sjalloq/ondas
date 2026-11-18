@@ -14,6 +14,9 @@ struct State {
 pub(super) struct Slot {
     state: Option<State>,
     pending: Option<Value>,
+    // Storage of a replaced value, reused by the next pending value so that a
+    // streamed change does not allocate.
+    spare: Option<Value>,
     changed: bool,
     events: u64,
 }
@@ -347,13 +350,14 @@ fn complete_tick<B>(
         #[cfg(test)]
         streaming_tests::commit_visit();
         let slot = &mut slots[index];
-        if let Some(value) = slot.pending.take()
-            && slot.changed
-        {
-            slot.state = Some(State {
-                value,
-                changed_at: slot.state.as_ref().map(|_| time),
-            });
+        if let Some(value) = slot.pending.take() {
+            if slot.changed {
+                let changed_at = slot.state.as_ref().map(|_| time);
+                let previous = slot.state.replace(State { value, changed_at });
+                slot.spare = previous.map(|state| state.value);
+            } else {
+                slot.spare = Some(value);
+            }
         }
         slot.events = 0;
         slot.changed = false;
@@ -1475,7 +1479,9 @@ impl<'w> Selection<'w> {
                     };
                     slot.events = count;
                 } else {
-                    slot.pending = Some(project(value, self.retained_signals[index]).to_owned());
+                    let value = project(value, self.retained_signals[index]);
+                    let spare = slot.pending.take().or_else(|| slot.spare.take());
+                    slot.pending = Some(value.to_owned_reusing(spare));
                 }
             }
             debug_assert!(active_slots.len() <= slots.len());
