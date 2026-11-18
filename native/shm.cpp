@@ -661,6 +661,21 @@ bool advance(Cursor &cursor, SstTime current, std::uint64_t end) {
     require(earlier(current, current_time(cursor)), "SHM history is not in source order");
     return true;
 }
+// Advances within a history and updates `current`. The next-time query names
+// the record the iterator lands on, so no further time query is made. A plain
+// 0 or 1 result is not an SDK object and needs no error query.
+bool step(Cursor &cursor, SstTime &current, std::uint64_t end) {
+    SstTime next{};
+    require(da_get_xvalseq(0x146, cursor.handle, &next) >= 0, "cannot read SHM next time");
+    if (next.sequence == UINT64_MAX || next.tick > end) return false;
+    const auto advanced = da_handle(0x17f, cursor.handle);
+    if (advanced > 1) check_handle(advanced, "cannot advance SHM value iterator");
+    require(advanced == 0 || advanced == 1, "invalid SHM advance result");
+    if (!advanced) return false;
+    require(earlier(current, next), "SHM history is not in source order");
+    current = next;
+    return true;
+}
 struct History {
     Record head{};
     bool ready = false, done = false, available = false, checkpoint = false;
@@ -693,8 +708,7 @@ struct History {
                         ready = true;
                         if (invalid_string) { done = true; break; }
                     }
-                    if (!advance(cursor, current, end)) { done = true; break; }
-                    current = current_time(cursor);
+                    if (!step(cursor, current, end)) { done = true; break; }
                 } catch (const std::exception &failure) {
                     {
                         Record failed{declaration.descriptor.id, tick, current.sequence,
@@ -859,6 +873,7 @@ struct ondas_shm {
     std::unique_ptr<Stream> stream;
     std::vector<Record> batch;
     size_t position = 0;
+    std::vector<ondas_shm_record> rows;
     std::vector<Record> points;
     bool point_ready = false;
     std::uint64_t point_end = 0;
@@ -1030,32 +1045,36 @@ extern "C" int ondas_shm_sample_bits(ondas_shm *reader, const uint64_t *ids, siz
         return 0;
     }
 }
+namespace {
+// Loads the next bounded batch from the active stream.
+void refill_batch(ondas_shm *reader) {
+    reader->batch.clear(); reader->position = 0;
+    reader->stream->queued_payload = 0;
+    // Amortize session restoration between interleaved readers. Both
+    // row count and payload are bounded; one value can cross the byte cap.
+    constexpr size_t batch_payload = 64 * 1024;
+    const size_t batch_records = reader->stream->first_batch ? 64 : 1024;
+    reader->stream->first_batch = false;
+    reader->batch.reserve(batch_records);
+    reader->work.pending_records = std::max<std::uint64_t>(reader->work.pending_records,
+        reader->stream->histories.capacity() + reader->batch.capacity() + 2);
+    while (reader->batch.size() < batch_records) {
+        const auto *next = reader->stream->next();
+        if (!next) break;
+        const bool failed = next->failed;
+        reader->batch.push_back(std::move(reader->stream->output));
+        reader->stream->output = {};
+        reader->stream->queued_payload += reader->batch.back().data.capacity();
+        reader->stream->account();
+        if (failed || reader->stream->queued_payload >= batch_payload) break;
+    }
+}
+}
 extern "C" int ondas_shm_next(ondas_shm *reader, ondas_shm_record *out, char *error, size_t cap, int *os_error) {
     *os_error = 0;
     try {
         if (!reader->stream) return 0;
-        if (reader->position == reader->batch.size()) {
-            reader->batch.clear(); reader->position = 0;
-            reader->stream->queued_payload = 0;
-            // Amortize session restoration between interleaved readers. Both
-            // row count and payload are bounded; one value can cross the byte cap.
-            constexpr size_t batch_payload = 64 * 1024;
-            const size_t batch_records = reader->stream->first_batch ? 64 : 1024;
-            reader->stream->first_batch = false;
-            reader->batch.reserve(batch_records);
-            reader->work.pending_records = std::max<std::uint64_t>(reader->work.pending_records,
-                reader->stream->histories.capacity() + reader->batch.capacity() + 2);
-            while (reader->batch.size() < batch_records) {
-                const auto *next = reader->stream->next();
-                if (!next) break;
-                const bool failed = next->failed;
-                reader->batch.push_back(std::move(reader->stream->output));
-                reader->stream->output = {};
-                reader->stream->queued_payload += reader->batch.back().data.capacity();
-                reader->stream->account();
-                if (failed || reader->stream->queued_payload >= batch_payload) break;
-            }
-        }
+        if (reader->position == reader->batch.size()) refill_batch(reader);
         if (reader->position == reader->batch.size()) return 0;
         const auto *record = &reader->batch[reader->position++];
         if (!reader->work.delivered) reader->work.first_delivery_records = reader->work.history_records;
@@ -1070,6 +1089,34 @@ extern "C" int ondas_shm_next(ondas_shm *reader, ondas_shm_record *out, char *er
         out->data = reinterpret_cast<const std::uint8_t *>(record->data.data());
         out->len = record->data.size();
         return 1;
+    } catch (const std::filesystem::filesystem_error &failure) {
+        const auto code = filesystem_failure(failure, os_error, error, cap);
+        return code == -2 ? -2 : -4;
+    } catch (const Unavailable &failure) { report(error, cap, failure.what()); return -3; }
+    catch (const std::exception &failure) { report(error, cap, failure.what()); }
+    catch (...) { report(error, cap, "unexpected SHM native exception"); }
+    return -4;
+}
+// Returns the leading successful rows of the current batch in one call, so
+// the caller takes the SDK lock once per batch. Row data stays valid until the
+// next call on this reader. A failed row is left for ondas_shm_next.
+extern "C" int ondas_shm_next_rows(ondas_shm *reader, const ondas_shm_record **out, size_t *count,
+                                    char *error, size_t cap, int *os_error) {
+    *os_error = 0; *out = nullptr; *count = 0;
+    try {
+        if (!reader->stream) return 0;
+        if (reader->position == reader->batch.size()) refill_batch(reader);
+        reader->rows.clear();
+        while (reader->position < reader->batch.size() && !reader->batch[reader->position].failed) {
+            const auto &record = reader->batch[reader->position++];
+            if (!reader->work.delivered) reader->work.first_delivery_records = reader->work.history_records;
+            ++reader->work.delivered;
+            reader->rows.push_back({record.id, record.tick, record.encoding,
+                                    reinterpret_cast<const std::uint8_t *>(record.data.data()),
+                                    record.data.size(), record.occurrences});
+        }
+        *out = reader->rows.data(); *count = reader->rows.size();
+        return 0;
     } catch (const std::filesystem::filesystem_error &failure) {
         const auto code = filesystem_failure(failure, os_error, error, cap);
         return code == -2 ? -2 : -4;

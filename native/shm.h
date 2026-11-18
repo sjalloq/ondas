@@ -91,6 +91,8 @@ int ondas_shm_read(ondas_shm *, const uint64_t *, size_t, uint64_t, uint64_t, in
 // A matching read consumes that traversal; other operations invalidate it.
 int ondas_shm_sample_bits(ondas_shm *, const uint64_t *, size_t, uint64_t, int prepare_fallback, ondas_shm_point *);
 int ondas_shm_next(ondas_shm *, ondas_shm_record *, char *, size_t, int *os_error);
+// Leading successful rows of the current batch; valid until the next call.
+int ondas_shm_next_rows(ondas_shm *, const ondas_shm_record **, size_t *, char *, size_t, int *os_error);
 void ondas_shm_end(ondas_shm *);
 #ifdef __cplusplus
 }

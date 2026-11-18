@@ -151,6 +151,14 @@ unsafe extern "C" {
         cap: usize,
         os_error: *mut c_int,
     ) -> c_int;
+    fn ondas_shm_next_rows(
+        reader: *mut c_void,
+        out: *mut *const Record,
+        count: *mut usize,
+        error: *mut c_char,
+        cap: usize,
+        os_error: *mut c_int,
+    ) -> c_int;
     fn ondas_shm_end(reader: *mut c_void);
     fn ondas_shm_sample_bits(
         reader: *mut c_void,
@@ -160,6 +168,27 @@ unsafe extern "C" {
         prepare_fallback: c_int,
         out: *mut Point,
     ) -> c_int;
+}
+/// Types one native row against its declared encoding.
+fn decode_row<'a>(encoding: Encoding, record: &Record, data: &'a [u8]) -> Result<ValueRef<'a>> {
+    Ok(match (encoding, record.encoding) {
+        (Encoding::Bits { width }, 1) if data.len() == width as usize => {
+            ValueRef::Bits(BitsRef::from_validated_ascii(data))
+        }
+        (Encoding::Real, 2) if data.len() == 8 => {
+            ValueRef::Real(f64::from_ne_bytes(data.try_into().unwrap()))
+        }
+        (Encoding::String, 3) => ValueRef::String(crate::value::ascii_string(
+            data,
+            crate::Format::Shm,
+            "shm-lib",
+            Time::from_ticks(record.tick),
+        )?),
+        (Encoding::Event, 4) if record.occurrences > 0 => ValueRef::Event {
+            occurrences: record.occurrences,
+        },
+        _ => return Err(error("SHM value disagrees with declaration")),
+    })
 }
 fn error(message: impl Into<String>) -> Error {
     Error::Backend {
@@ -705,6 +734,73 @@ impl Reader {
         let mut data = Vec::new();
         let mut previous = 0;
         loop {
+            // Fast path: take the successful rows of one native batch under a
+            // single lock. The shim keeps their bytes until the next call on
+            // this reader, and `&mut self` excludes such a call from visitors.
+            let rows: &[Record] = {
+                let _lock = lock();
+                let mut rows = std::ptr::null();
+                let mut count = 0;
+                // SAFETY: live owner and writable outputs.
+                let code = unsafe {
+                    ondas_shm_next_rows(
+                        traversal.0.0.as_ptr(),
+                        &mut rows,
+                        &mut count,
+                        buffer.as_mut_ptr(),
+                        buffer.len(),
+                        &mut os_error,
+                    )
+                };
+                if code < 0 {
+                    return Err(status(code, os_error, &buffer, "read").unwrap_err());
+                }
+                if count == 0 || rows.is_null() {
+                    &[]
+                } else {
+                    // SAFETY: the shim returned `count` initialized rows.
+                    unsafe { std::slice::from_raw_parts(rows, count) }
+                }
+            };
+            for record in rows {
+                if record.tick < previous || record.tick > end.ticks() {
+                    return Err(error("invalid SHM record order"));
+                }
+                previous = record.tick;
+                if record.tick < from.ticks() {
+                    continue;
+                }
+                let bytes: &[u8] = if record.len > 0 {
+                    if record.data.is_null() || record.len > isize::MAX as usize {
+                        return Err(error("invalid SHM value buffer"));
+                    }
+                    // SAFETY: row bytes live until the next call on this reader.
+                    unsafe { std::slice::from_raw_parts(record.data, record.len) }
+                } else {
+                    &[]
+                };
+                let index = usize::try_from(record.id)
+                    .ok()
+                    .and_then(|id| self.indices.get(id))
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| error("unknown SHM history identity"))?;
+                let value = decode_row(self.encodings[index], record, bytes);
+                let failed = value.is_err();
+                if let ControlFlow::Break(value) =
+                    visitor(index, Time::from_ticks(record.tick), value)
+                {
+                    return Ok(ControlFlow::Break(value));
+                }
+                if failed {
+                    return Err(error("SHM visitor continued after a decoding failure"));
+                }
+            }
+            if !rows.is_empty() {
+                continue;
+            }
+            // No successful row is pending: the stream ended or the next row
+            // failed. The single-row call reports which.
             let mut record = Record::default();
             let failure;
             {
@@ -756,26 +852,7 @@ impl Reader {
             let value = if let Some(failure) = failure {
                 Err(failure)
             } else {
-                (|| {
-                    Ok(match (self.encodings[index], record.encoding) {
-                        (Encoding::Bits { width }, 1) if data.len() == width as usize => {
-                            ValueRef::Bits(BitsRef::from_validated_ascii(&data))
-                        }
-                        (Encoding::Real, 2) if data.len() == 8 => {
-                            ValueRef::Real(f64::from_ne_bytes(data.as_slice().try_into().unwrap()))
-                        }
-                        (Encoding::String, 3) => ValueRef::String(crate::value::ascii_string(
-                            &data,
-                            crate::Format::Shm,
-                            "shm-lib",
-                            Time::from_ticks(record.tick),
-                        )?),
-                        (Encoding::Event, 4) if record.occurrences > 0 => ValueRef::Event {
-                            occurrences: record.occurrences,
-                        },
-                        _ => return Err(error("SHM value disagrees with declaration")),
-                    })
-                })()
+                decode_row(self.encodings[index], &record, &data)
             };
             let failed = value.is_err();
             if let ControlFlow::Break(value) = visitor(index, Time::from_ticks(record.tick), value)
