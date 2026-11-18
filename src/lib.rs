@@ -523,7 +523,8 @@ pub use time::{Time, TimeRange, TimeSpan, TimeUnit, Timescale};
 pub use value::{Bits, BitsRef, Logic, Value, ValueRef};
 /// Waveform sources, metadata, formats, and opening functions.
 pub use waveform::{
-    Format, Metadata, Waveform, open, open_bytes, open_bytes_with, open_with, read_metadata,
+    Format, Metadata, ShmScopeChild, Waveform, list_shm_scope, open, open_bytes, open_bytes_with,
+    open_shm_scopes, open_with, read_metadata,
 };
 
 /// A result returned by waveform opening and query operations.

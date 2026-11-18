@@ -105,6 +105,101 @@ pub fn open_with(path: impl AsRef<Path>, backend: &str) -> Result<Waveform> {
     open_file(path.as_ref(), Some(backend))
 }
 
+/// One immediate child of an SHM scope. [`list_shm_scope`] returns it.
+///
+/// Experimental. This type can change or be removed without a major release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShmScopeChild {
+    /// The hierarchy component, as [`Hierarchy`] names it.
+    pub name: String,
+    /// `true` for a scope, `false` for a variable.
+    pub is_scope: bool,
+}
+
+/// Opens an SHM database directory and imports only the selected scope subtrees.
+///
+/// Experimental. This function can change or be removed without a major release.
+///
+/// Each entry of `scopes` is a scope path with [`HierarchyPath`] syntax. The
+/// import keeps all declarations at and below each selected scope. A strict
+/// ancestor of a selected scope keeps its scope entry, without its variables
+/// and without unselected child scopes. Other scopes are not imported. An empty
+/// list imports the full hierarchy, as [`open_with`] with `shm-lib` does.
+///
+/// Signal handles, [`Hierarchy::signals`] and [`Hierarchy::variables`] contain
+/// only imported declarations. Aliases join only within the imported part.
+/// Value queries for imported signals read the same source histories as a full open.
+///
+/// A path that does not select a scope returns [`Error::Backend`]. Without the
+/// `shm-lib` feature, this returns [`Error::NoBackend`].
+pub fn open_shm_scopes(path: impl AsRef<Path>, scopes: &[&str]) -> Result<Waveform> {
+    #[cfg(feature = "shm-lib")]
+    {
+        let path = path.as_ref();
+        let scopes = scopes
+            .iter()
+            .map(|scope| shm_scope_path(scope))
+            .collect::<Result<Vec<_>>>()?;
+        let (reader, hierarchy, metadata) = crate::backends::shm::Reader::open_scoped(
+            path,
+            path.to_string_lossy().into_owned(),
+            &scopes,
+        )?;
+        Ok(Waveform {
+            compositions: composition::Compositions::default(),
+            reader: Reader::Shm(Box::new(reader)),
+            hierarchy,
+            metadata,
+        })
+    }
+    #[cfg(not(feature = "shm-lib"))]
+    {
+        let _ = (path, scopes);
+        Err(Error::NoBackend {
+            format: Format::Shm,
+        })
+    }
+}
+
+/// Lists the immediate children of one SHM scope without a hierarchy import.
+///
+/// Experimental. This function can change or be removed without a major release.
+///
+/// `scope` has [`HierarchyPath`] syntax. An empty string lists the top level.
+/// Child names are the components that [`open_shm_scopes`] imports. Transparent
+/// scope arrays show their elements, for example `gen[0]`. Fields of composite
+/// variables are not listed. A path that does not select a scope returns
+/// [`Error::Backend`]. Without the `shm-lib` feature, this returns [`Error::NoBackend`].
+pub fn list_shm_scope(path: impl AsRef<Path>, scope: &str) -> Result<Vec<ShmScopeChild>> {
+    #[cfg(feature = "shm-lib")]
+    {
+        let scope = shm_scope_path(scope)?;
+        Ok(crate::backends::shm::list_children(path.as_ref(), &scope)?
+            .into_iter()
+            .map(|(name, is_scope)| ShmScopeChild { name, is_scope })
+            .collect())
+    }
+    #[cfg(not(feature = "shm-lib"))]
+    {
+        let _ = (path, scope);
+        Err(Error::NoBackend {
+            format: Format::Shm,
+        })
+    }
+}
+
+#[cfg(feature = "shm-lib")]
+fn shm_scope_path(text: &str) -> Result<crate::HierarchyPath> {
+    if text.is_empty() {
+        return Ok(crate::HierarchyPath::from_components(Vec::<String>::new()));
+    }
+    crate::HierarchyPath::parse(text).map_err(|error| Error::Backend {
+        backend: "shm-lib".into(),
+        operation: "open",
+        message: format!("invalid SHM scope path {text:?}: {error}"),
+    })
+}
+
 /// Opens shared in-memory bytes with an automatically selected backend.
 ///
 /// `name` is the logical [`Metadata::source_name`] and a format-detection hint.

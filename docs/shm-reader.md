@@ -20,6 +20,10 @@ SST2 shares open files and a global time unit. One stream can retain its session
 
 Selected queries follow owned enumeration routes from the imported hierarchy. These routes contain names and positions, not native handles. They require unchanged source components. They skip unrelated subtrees. Adapter counters still cannot measure SST2's internal work.
 
+## Scoped import is experimental
+
+`open_shm_scopes` imports only selected scope subtrees. Strict ancestors keep their scope entries and only the child scopes on a selected route. The walk counts every source sibling, also skipped siblings, so each route keeps its true source position. Skipped variables get no type or description query. Unselected scopes are not enumerated. Each ancestor still scans its child scopes and reads their names. `list_shm_scope` classifies the children of one scope without a declaration import.
+
 ## Certification is not a constant-time point operation
 
 Qualified bit histories can certify continuous availability and seek a point. They then walk back through equal values to establish normalized change time. Certification can itself process history inside SST2. Unsupported layouts and projections of a non-scalar base use ordinary reading. An unqualified history need not put every qualified history in the same batch on that path.

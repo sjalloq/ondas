@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <memory>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -310,6 +311,99 @@ void hierarchy(SstHandle parent, std::vector<Declaration> &out,
     for (SstHandle variable; (variable = variables.next()); ++ordinal) {
         const auto node = source_node(nodes, parent_node, 0x2be, ordinal, variable);
         import_variable(variable, "", out, identities, nodes, node);
+    }
+}
+
+// Experimental scoped import. A filter node is a strict ancestor of at least
+// one selected scope unless it is marked full (import its subtree) or list
+// (report only its immediate children). Names are hierarchy components exactly
+// as hierarchy() names scopes, including transparent scope-array prefixes.
+struct ScopeFilter {
+    bool full = false, list = false, reached = false;
+    std::string path;
+    std::map<std::string, ScopeFilter> children;
+    bool may_contain(const std::string &name, const std::string &raw) const {
+        if (children.count(name)) return true;
+        // A transparent scope array (kind 10) named raw contributes children
+        // named raw[element]. Its kind is only queried for a possible match.
+        const auto prefix = raw + "[";
+        const auto next = children.lower_bound(prefix);
+        return next != children.end() && next->first.compare(0, prefix.size(), prefix) == 0;
+    }
+    void unreached(std::vector<std::string> &missing) const {
+        if ((full || list) && !reached) missing.push_back(path);
+        // A full import includes nested selections; they are not checked.
+        if (full) return;
+        for (const auto &child : children) child.second.unreached(missing);
+    }
+};
+struct Child {
+    std::string name;
+    int is_scope;
+};
+std::string scope_name(SstHandle child, int kind, const std::string &raw,
+                       const std::string &scope_array, std::string *definition_out) {
+    std::string name = scope_array.empty() ? raw : scope_array + "[" + raw + "]";
+    std::string definition = text(0x10a, da_handle(0x14e, child));
+    // Same VHDL top rule as hierarchy().
+    if (name.empty() && kind == 3 && da_get(0x103, child) == 7) {
+        const auto separator = definition.find('.');
+        require(separator != std::string::npos, "missing SHM VHDL top definition");
+        name = definition.substr(separator + 1);
+    }
+    if (definition_out) *definition_out = std::move(definition);
+    return name;
+}
+void list_children(SstHandle parent, std::vector<Child> &listing, const std::string &scope_array = "") {
+    // Classification only: no variable descriptions, enum tables or routes.
+    Enumeration children(0x2ae, parent);
+    for (SstHandle child; (child = children.next());) {
+        std::string raw = text(0x10a, child);
+        if (da_get(0x173, da_handle(0x1be, child)) >= 0) { listing.push_back({std::move(raw), 0}); continue; }
+        const int kind = da_get(0x113, child);
+        if (kind == 10) { list_children(child, listing, raw); continue; }
+        listing.push_back({scope_name(child, kind, raw, scope_array, nullptr), 1});
+    }
+    Enumeration variables(0x2be, parent);
+    for (SstHandle variable; (variable = variables.next());) listing.push_back({text(0x10a, variable), 0});
+}
+void scoped_hierarchy(SstHandle parent, std::vector<Declaration> &out,
+                      std::unordered_map<SstHandle, std::uint64_t> &identities,
+                      std::vector<SourceNode> &nodes, ScopeFilter &filter,
+                      std::vector<Child> &listing, size_t parent_node = root_node,
+                      const std::string &scope_array = "") {
+    // Ordinals count every source sibling, also skipped ones, so that routes
+    // keep true source positions for resolve_children(). An ancestor imports
+    // no variables, so its 0x2be enumeration is not visited.
+    Enumeration children(0x2ae, parent);
+    size_t ordinal = 0;
+    for (SstHandle child; (child = children.next()); ++ordinal) {
+        std::string raw = text(0x10a, child);
+        // An empty raw name can be a VHDL top named from its definition.
+        if (!raw.empty() && !filter.may_contain(scope_array.empty() ? raw : scope_array + "[" + raw + "]", raw))
+            continue;
+        if (da_get(0x173, da_handle(0x1be, child)) >= 0) continue;
+        const int kind = da_get(0x113, child);
+        if (kind == 10) {
+            nodes.push_back({parent_node, ordinal, 0x2ae, raw});
+            scoped_hierarchy(child, out, identities, nodes, filter, listing, nodes.size() - 1, raw);
+            continue;
+        }
+        Declaration scope;
+        scope.name = scope_name(child, kind, raw, scope_array, &scope.definition);
+        const auto selected = filter.children.find(scope.name);
+        if (selected == filter.children.end()) continue;
+        auto &sub = selected->second;
+        nodes.push_back({parent_node, ordinal, 0x2ae, std::move(raw)});
+        const auto node = nodes.size() - 1;
+        scope.kind = kind == 6 ? "module" : kind == 3 ? "architecture" : "shm:scope:" + std::to_string(kind);
+        out.push_back(std::move(scope));
+        if (sub.full) { sub.reached = true; hierarchy(child, out, identities, nodes, node); }
+        else if (sub.list) { sub.reached = true; list_children(child, listing); }
+        else scoped_hierarchy(child, out, identities, nodes, sub, listing, node);
+        Declaration end;
+        end.descriptor.entry = 1;
+        out.push_back(std::move(end));
     }
 }
 
@@ -769,8 +863,11 @@ struct ondas_shm {
     bool point_ready = false;
     std::uint64_t point_end = 0;
     std::vector<std::uint64_t> point_ids;
+    std::vector<Child> children;
 };
-extern "C" int ondas_shm_open(const char *path, int metadata_only, ondas_shm **out, char *error, size_t cap, int *os_error) {
+namespace {
+// filter == nullptr: metadata only. A full root filter: ordinary full import.
+int open_owner(const char *path, ScopeFilter *filter, ondas_shm **out, char *error, size_t cap, int *os_error) {
     *out = nullptr;
     *os_error = 0;
     try {
@@ -779,9 +876,18 @@ extern "C" int ondas_shm_open(const char *path, int metadata_only, ondas_shm **o
         Session session(reader->path);
         ++reader->work.sessions;
         reader->meta = metadata(session.handle);
-        if (!metadata_only) {
+        if (filter) {
             std::unordered_map<SstHandle, std::uint64_t> identities;
-            hierarchy(session.handle, reader->declarations, identities, reader->source_nodes);
+            if (filter->full) {
+                filter->reached = true;
+                hierarchy(session.handle, reader->declarations, identities, reader->source_nodes);
+            }
+            else if (filter->list) { filter->reached = true; list_children(session.handle, reader->children); }
+            else scoped_hierarchy(session.handle, reader->declarations, identities, reader->source_nodes,
+                                  *filter, reader->children);
+            std::vector<std::string> missing;
+            filter->unreached(missing);
+            if (!missing.empty()) throw std::runtime_error("SHM scope not found: " + missing.front());
             reader->work.hierarchy_nodes += reader->source_nodes.size();
             for (auto &d : reader->declarations) d.variable = 0;
         }
@@ -792,6 +898,45 @@ extern "C" int ondas_shm_open(const char *path, int metadata_only, ondas_shm **o
     catch (const std::exception &failure) { report(error, cap, failure.what()); }
     catch (...) { report(error, cap, "unexpected SHM native exception"); }
     return -1;
+}
+std::string display_path(const char *const *components, size_t count) {
+    std::string path;
+    for (size_t i = 0; i < count; ++i) path += (i ? "." : "") + std::string(components[i]);
+    return path;
+}
+}
+extern "C" int ondas_shm_open(const char *path, int metadata_only, ondas_shm **out, char *error, size_t cap, int *os_error) {
+    ScopeFilter all;
+    all.full = true;
+    return open_owner(path, metadata_only ? nullptr : &all, out, error, cap, os_error);
+}
+extern "C" int ondas_shm_open_scoped(const char *path, const char *const *components,
+                                     const size_t *path_lengths, size_t path_count,
+                                     ondas_shm **out, char *error, size_t cap, int *os_error) {
+    ScopeFilter root;
+    root.full = path_count == 0;
+    for (size_t p = 0, first = 0; p < path_count; first += path_lengths[p++]) {
+        ScopeFilter *node = &root;
+        for (size_t c = 0; c < path_lengths[p]; ++c) node = &node->children[components[first + c]];
+        // An empty path selects the whole design.
+        node->full = true;
+        node->path = display_path(components + first, path_lengths[p]);
+    }
+    return open_owner(path, &root, out, error, cap, os_error);
+}
+extern "C" int ondas_shm_list(const char *path, const char *const *components, size_t count,
+                              ondas_shm **out, char *error, size_t cap, int *os_error) {
+    ScopeFilter root;
+    ScopeFilter *node = &root;
+    for (size_t c = 0; c < count; ++c) node = &node->children[components[c]];
+    node->list = true;
+    node->path = display_path(components, count);
+    return open_owner(path, &root, out, error, cap, os_error);
+}
+extern "C" size_t ondas_shm_child_count(const ondas_shm *reader) { return reader->children.size(); }
+extern "C" void ondas_shm_child_at(const ondas_shm *reader, size_t index, ondas_shm_child *out) {
+    const auto &child = reader->children[index];
+    *out = {child.name.c_str(), child.is_scope};
 }
 extern "C" void ondas_shm_close(ondas_shm *reader) { delete reader; }
 extern "C" void ondas_shm_metadata(const ondas_shm *reader, ondas_shm_meta *out) { *out = reader->meta; }

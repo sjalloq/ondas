@@ -55,6 +55,24 @@ typedef struct {
 // -2 preserves os_error, -3 means unavailable, -4 is an unknown traversal error.
 // On a timed next error, output identifies the failed history and source tick.
 int ondas_shm_open(const char *, int metadata_only, ondas_shm **, char *, size_t, int *os_error);
+// Experimental scoped import. path_count paths are given as consecutive
+// hierarchy components (path_lengths[i] components each). Scopes at or below a
+// selected path import fully; strict ancestors keep only their scope entries
+// and the child scopes on a selected route. Zero paths is a full import. A path
+// that matches no scope fails the open. Routes keep true source positions.
+int ondas_shm_open_scoped(const char *, const char *const *components, const size_t *path_lengths,
+                          size_t path_count, ondas_shm **, char *, size_t, int *os_error);
+// Experimental: lists the immediate children of one scope (zero components:
+// the top level) without importing declarations. Transparent scope arrays are
+// expanded as hierarchy() names them. The owner has no declarations to read.
+typedef struct {
+    const char *name;
+    int is_scope;
+} ondas_shm_child;
+int ondas_shm_list(const char *, const char *const *components, size_t count, ondas_shm **,
+                   char *, size_t, int *os_error);
+size_t ondas_shm_child_count(const ondas_shm *);
+void ondas_shm_child_at(const ondas_shm *, size_t, ondas_shm_child *);
 void ondas_shm_close(ondas_shm *);
 void ondas_shm_metadata(const ondas_shm *, ondas_shm_meta *);
 void ondas_shm_work_done(const ondas_shm *, ondas_shm_work *);

@@ -1,8 +1,8 @@
 //! Private build-selected SST2 adapter. Vendor state is serialized and suspended
 //! before another operation changes the shared files or global time unit.
 use crate::{
-    BitRange, BitsRef, Direction, Encoding, Error, Hierarchy, Metadata, Result, Signal, Time,
-    TimeSpan, TimeUnit, Timescale, ValueRef,
+    BitRange, BitsRef, Direction, Encoding, Error, Hierarchy, HierarchyPath, Metadata, Result,
+    Signal, Time, TimeSpan, TimeUnit, Timescale, ValueRef,
     hierarchy::{EnumerationData, ScopeData, VariableData},
 };
 use std::{
@@ -43,6 +43,11 @@ struct Declaration {
 struct EnumVariant {
     encoded: *const c_char,
     label: *const c_char,
+}
+#[repr(C)]
+struct Child {
+    name: *const c_char,
+    is_scope: c_int,
 }
 #[repr(C)]
 #[derive(Default)]
@@ -95,6 +100,27 @@ unsafe extern "C" {
         cap: usize,
         os_error: *mut c_int,
     ) -> c_int;
+    fn ondas_shm_open_scoped(
+        path: *const c_char,
+        components: *const *const c_char,
+        path_lengths: *const usize,
+        path_count: usize,
+        out: *mut *mut c_void,
+        error: *mut c_char,
+        cap: usize,
+        os_error: *mut c_int,
+    ) -> c_int;
+    fn ondas_shm_list(
+        path: *const c_char,
+        components: *const *const c_char,
+        count: usize,
+        out: *mut *mut c_void,
+        error: *mut c_char,
+        cap: usize,
+        os_error: *mut c_int,
+    ) -> c_int;
+    fn ondas_shm_child_count(reader: *const c_void) -> usize;
+    fn ondas_shm_child_at(reader: *const c_void, index: usize, out: *mut Child);
     fn ondas_shm_close(reader: *mut c_void);
     fn ondas_shm_metadata(reader: *const c_void, out: *mut Meta);
     #[cfg(test)]
@@ -196,7 +222,23 @@ impl Drop for Handle {
         unsafe { ondas_shm_close(self.0.as_ptr()) };
     }
 }
-fn open_handle(path: &Path, metadata_only: bool) -> Result<Handle> {
+// Native open request. Scope paths are exact hierarchy components.
+enum Open<'a> {
+    Metadata,
+    Full,
+    Scoped(&'a [HierarchyPath]),
+    List(&'a HierarchyPath),
+}
+fn component_strings(paths: &[&HierarchyPath]) -> Result<Vec<CString>> {
+    paths
+        .iter()
+        .flat_map(|path| path.components())
+        .map(|component| {
+            CString::new(component).map_err(|_| error("NUL in SHM scope path component"))
+        })
+        .collect()
+}
+fn open_handle(path: &Path, request: Open<'_>) -> Result<Handle> {
     if !path.is_dir() {
         return Err(error("SHM input requires a database directory"));
     }
@@ -210,26 +252,57 @@ fn open_handle(path: &Path, metadata_only: bool) -> Result<Handle> {
     let mut raw = std::ptr::null_mut();
     let mut buffer = [0; 512];
     let mut os_error = 0;
+    let (owned, lengths) = match &request {
+        Open::Scoped(paths) => (
+            component_strings(&paths.iter().collect::<Vec<_>>())?,
+            paths.iter().map(HierarchyPath::len).collect(),
+        ),
+        Open::List(scope) => (component_strings(&[scope])?, Vec::new()),
+        Open::Metadata | Open::Full => (Vec::new(), Vec::new()),
+    };
+    let components: Vec<_> = owned.iter().map(|c| c.as_ptr()).collect();
     let _lock = lock();
-    // SAFETY: valid caller-owned buffers. No pointers into Rust are retained.
+    // SAFETY: valid caller-owned buffers and component arrays that outlive the
+    // call. No pointers into Rust are retained.
     let code = unsafe {
-        ondas_shm_open(
-            path.as_ptr(),
-            metadata_only.into(),
-            &mut raw,
-            buffer.as_mut_ptr(),
-            buffer.len(),
-            &mut os_error,
-        )
+        match request {
+            Open::Metadata | Open::Full => ondas_shm_open(
+                path.as_ptr(),
+                matches!(request, Open::Metadata).into(),
+                &mut raw,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut os_error,
+            ),
+            Open::Scoped(_) => ondas_shm_open_scoped(
+                path.as_ptr(),
+                components.as_ptr(),
+                lengths.as_ptr(),
+                lengths.len(),
+                &mut raw,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut os_error,
+            ),
+            Open::List(_) => ondas_shm_list(
+                path.as_ptr(),
+                components.as_ptr(),
+                components.len(),
+                &mut raw,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut os_error,
+            ),
+        }
     };
     status(
         code,
         os_error,
         &buffer,
-        if metadata_only {
-            "read metadata"
-        } else {
-            "open"
+        match request {
+            Open::Metadata => "read metadata",
+            Open::List(_) => "list scope",
+            Open::Full | Open::Scoped(_) => "open",
         },
     )?;
     Ok(Handle(
@@ -275,8 +348,30 @@ fn metadata(handle: &Handle, source_name: String) -> Result<Metadata> {
     })
 }
 pub(crate) fn read_metadata(path: &Path, name: String) -> Result<Metadata> {
-    let handle = open_handle(path, true)?;
+    let handle = open_handle(path, Open::Metadata)?;
     metadata(&handle, name)
+}
+/// Lists the immediate children of one scope as `(name, is_scope)`.
+pub(crate) fn list_children(path: &Path, scope: &HierarchyPath) -> Result<Vec<(String, bool)>> {
+    let handle = open_handle(path, Open::List(scope))?;
+    let _lock = lock();
+    // SAFETY: a live immutable owner; strings are copied under the lock.
+    unsafe {
+        let count = ondas_shm_child_count(handle.0.as_ptr());
+        let mut children = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut child = Child {
+                name: std::ptr::null(),
+                is_scope: 0,
+            };
+            ondas_shm_child_at(handle.0.as_ptr(), index, &mut child);
+            children.push((
+                string(child.name)?.ok_or_else(|| error("missing SHM child name"))?,
+                child.is_scope != 0,
+            ));
+        }
+        Ok(children)
+    }
 }
 pub(crate) struct Reader {
     handle: Handle,
@@ -297,7 +392,22 @@ impl Reader {
         work
     }
     pub(crate) fn open(path: &Path, name: String) -> Result<(Self, Hierarchy, Metadata)> {
-        let handle = open_handle(path, false)?;
+        Self::open_scoped(path, name, &[])
+    }
+    // An empty scope list is the ordinary full import.
+    pub(crate) fn open_scoped(
+        path: &Path,
+        name: String,
+        scopes: &[HierarchyPath],
+    ) -> Result<(Self, Hierarchy, Metadata)> {
+        let handle = open_handle(
+            path,
+            if scopes.is_empty() {
+                Open::Full
+            } else {
+                Open::Scoped(scopes)
+            },
+        )?;
         let meta = metadata(&handle, name)?;
         let (mut scopes, mut variables, mut stack) = (Vec::new(), Vec::new(), Vec::new());
         let (mut ids, mut indices, mut encodings) = (Vec::new(), Vec::new(), Vec::new());
