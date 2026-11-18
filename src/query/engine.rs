@@ -186,6 +186,9 @@ impl QueryContext<'_> {
     }
 }
 
+// Inlined: an out-of-line call reloads the value from the stack in one wide
+// load right after narrower stores, which stalls on store forwarding.
+#[inline(always)]
 fn project(value: ValueRef<'_>, signal: Signal) -> ValueRef<'_> {
     match value {
         ValueRef::Bits(bits) if signal.is_slice() => {

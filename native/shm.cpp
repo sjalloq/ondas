@@ -614,9 +614,13 @@ bool before(const Record &a, const Record &b) {
     if (a.id != b.id) return a.id < b.id;
     return a.sequence < b.sequence;
 }
-Record decode(const Declaration &declaration, Cursor &cursor, SstTime current, int state) {
+// Decodes the cursor's record into `record` in place. Writing the value where
+// it stays avoids copying bytes that were stored an instant earlier, which
+// stalls on store-to-load forwarding. On failure `record` is unspecified.
+void decode(Record &record, const Declaration &declaration, Cursor &cursor, SstTime current, int state) {
     const auto &d = declaration.descriptor;
-    Record record{d.id, current.tick, current.sequence, d.encoding, false, {}};
+    record.id = d.id; record.tick = current.tick; record.sequence = current.sequence;
+    record.encoding = d.encoding; record.failed = false; record.occurrences = 0;
     require(state >= 0, "SHM history has an unavailable recording interval");
     if (d.encoding == 1) {
         // The declared width bounds the text, so no length scan is needed. A
@@ -645,9 +649,9 @@ Record decode(const Declaration &declaration, Cursor &cursor, SstTime current, i
         record.data = ondas_shm_value::decode_quoted(encoded);
     } else if (d.encoding == 4) {
         require(state == 2, "unsupported SHM event state");
+        record.data.clear();
         record.occurrences = 1;
     } else throw std::runtime_error("unsupported SHM value encoding");
-    return record;
 }
 bool earlier(SstTime a, SstTime b) {
     return a.tick < b.tick || (a.tick == b.tick && a.sequence < b.sequence);
@@ -701,17 +705,18 @@ struct History {
                 try {
                     if (!(declaration.descriptor.encoding == 4 && state == 1) && !(state < 0 && !available)) {
                         available = true;
-                        auto value = decode(declaration, cursor, current, state);
-                        account(&value);
+                        const std::uint64_t earlier_events =
+                            ready && declaration.descriptor.encoding == 4 ? head.occurrences : 0;
+                        decode(head, declaration, cursor, current, state);
+                        account(nullptr);
                         // Rust preserves the typed ASCII-domain error. Do not
                         // overwrite an invalid intermediate string at this tick.
-                        const bool invalid_string = value.encoding == 3 &&
-                            std::any_of(value.data.begin(), value.data.end(), [](unsigned char c) { return c > 127; });
-                        if (ready && value.encoding == 4) {
-                            require(head.occurrences != UINT64_MAX, "SHM event count overflow");
-                            value.occurrences += head.occurrences;
+                        const bool invalid_string = head.encoding == 3 &&
+                            std::any_of(head.data.begin(), head.data.end(), [](unsigned char c) { return c > 127; });
+                        if (earlier_events) {
+                            require(earlier_events != UINT64_MAX, "SHM event count overflow");
+                            head.occurrences += earlier_events;
                         }
-                        head = std::move(value);
                         ready = true;
                         if (invalid_string) { done = true; break; }
                     }
@@ -785,9 +790,11 @@ struct Stream {
         const auto &head = histories[index].head;
         return {head.tick, head.id, head.sequence, index};
     }
-    void sift_down(size_t at) {
+    // Places `moved` at the top and restores order. The entry is passed by
+    // value: storing it and loading it back stalls on store forwarding.
+    void replace_top(const Entry moved) {
         const auto count = heap.size();
-        const Entry moved = heap[at];
+        size_t at = 0;
         for (;;) {
             auto child = 2 * at + 1;
             if (child >= count) break;
@@ -844,9 +851,12 @@ struct Stream {
             // Replace the stale top in place. A history's next record is often
             // still the least, so this usually moves nothing.
             fill(refill);
-            if (histories[refill].ready) heap.front() = entry(refill);
-            else { heap.front() = heap.back(); heap.pop_back(); }
-            if (!heap.empty()) sift_down(0);
+            if (histories[refill].ready) replace_top(entry(refill));
+            else {
+                const Entry last = heap.back();
+                heap.pop_back();
+                if (!heap.empty()) replace_top(last);
+            }
             refill = root_node;
         }
         if (heap.empty()) return nullptr;
