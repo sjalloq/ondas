@@ -56,6 +56,32 @@ struct Meta {
     last: u64,
     exponent: i32,
 }
+/// Totals of one experimental direct SHM read.
+///
+/// [`crate::Waveform::read_shm_direct`] returns it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShmDirectRead {
+    /// Source records visited, including records before the range start.
+    pub records: u64,
+    /// Values counted in the range: one per tick per signal, without repeats.
+    pub changes: u64,
+    /// Bytes of the counted values. An event counts as 8.
+    pub payload: u64,
+    /// Signals for which the seek found no record before the range start.
+    pub seek_misses: u64,
+    /// Seconds to open the session and resolve the selected declarations.
+    pub setup_seconds: f64,
+    /// Seconds to load histories and create their iterators.
+    pub cursor_seconds: f64,
+    /// Seconds spent in seeks.
+    pub seek_seconds: f64,
+    /// Seconds spent reading records.
+    pub read_seconds: f64,
+}
+pub(crate) fn not_shm() -> Error {
+    error("the waveform is not an SHM database")
+}
 #[repr(C)]
 #[derive(Default)]
 struct Record {
@@ -155,6 +181,18 @@ unsafe extern "C" {
         reader: *mut c_void,
         out: *mut *const Record,
         count: *mut usize,
+        error: *mut c_char,
+        cap: usize,
+        os_error: *mut c_int,
+    ) -> c_int;
+    fn ondas_shm_read_direct(
+        reader: *mut c_void,
+        ids: *const u64,
+        count: usize,
+        from: u64,
+        end: u64,
+        seek: c_int,
+        out: *mut ShmDirectRead,
         error: *mut c_char,
         cap: usize,
         os_error: *mut c_int,
@@ -543,6 +581,40 @@ impl Reader {
             hierarchy,
             meta,
         ))
+    }
+    pub(crate) fn read_direct(
+        &mut self,
+        signals: &[Signal],
+        from: Time,
+        end: Time,
+        seek: bool,
+    ) -> Result<ShmDirectRead> {
+        self.point_fallback = None;
+        let ids: Vec<_> = signals.iter().map(|s| self.ids[s.index()]).collect();
+        let traversal = Traversal(&mut self.handle);
+        let mut out = ShmDirectRead::default();
+        let mut buffer = [0; 512];
+        let mut os_error = 0;
+        let code = {
+            let _lock = lock();
+            // SAFETY: live exclusive owner, validated identities and outputs.
+            unsafe {
+                ondas_shm_read_direct(
+                    traversal.0.0.as_ptr(),
+                    ids.as_ptr(),
+                    ids.len(),
+                    from.ticks(),
+                    end.ticks(),
+                    c_int::from(seek),
+                    &mut out,
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                    &mut os_error,
+                )
+            }
+        };
+        status(code, os_error, &buffer, "direct read")?;
+        Ok(out)
     }
     pub(crate) fn sample_bits(
         &mut self,

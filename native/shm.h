@@ -90,6 +90,16 @@ int ondas_shm_read(ondas_shm *, const uint64_t *, size_t, uint64_t, uint64_t, in
 // in input order. With no certified values, prepare_fallback controls preparation.
 // A matching read consumes that traversal; other operations invalidate it.
 int ondas_shm_sample_bits(ondas_shm *, const uint64_t *, size_t, uint64_t, int prepare_fallback, ondas_shm_point *);
+// Experimental. Totals of one direct read: every history is read in turn in
+// one session, with no merge and no rows returned. `changes` counts one value
+// per tick per history, without repeats of the same value, inside the range.
+typedef struct {
+    uint64_t records, changes, payload, seek_misses;
+    double setup_seconds, cursor_seconds, seek_seconds, read_seconds;
+} ondas_shm_direct;
+// With `seek`, each cursor first seeks to the last record before `from`.
+int ondas_shm_read_direct(ondas_shm *, const uint64_t *, size_t, uint64_t from, uint64_t end, int seek,
+                          ondas_shm_direct *, char *, size_t, int *os_error);
 int ondas_shm_next(ondas_shm *, ondas_shm_record *, char *, size_t, int *os_error);
 // Leading successful rows of the current batch; valid until the next call.
 int ondas_shm_next_rows(ondas_shm *, const ondas_shm_record **, size_t *, char *, size_t, int *os_error);

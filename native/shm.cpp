@@ -2,6 +2,7 @@
 #include "shm_sst2.h"
 #include "shm_value.h"
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -1174,6 +1175,77 @@ extern "C" int ondas_shm_next_rows(ondas_shm *reader, const ondas_shm_record **o
                                     record.data.size(), record.occurrences});
         }
         *out = reader->rows.data(); *count = reader->rows.size();
+        return 0;
+    } catch (const std::filesystem::filesystem_error &failure) {
+        const auto code = filesystem_failure(failure, os_error, error, cap);
+        return code == -2 ? -2 : -4;
+    } catch (const Unavailable &failure) { report(error, cap, failure.what()); return -3; }
+    catch (const std::exception &failure) { report(error, cap, failure.what()); }
+    catch (...) { report(error, cap, "unexpected SHM native exception"); }
+    return -4;
+}
+extern "C" int ondas_shm_read_direct(ondas_shm *reader, const uint64_t *ids, size_t count,
+                                      uint64_t from, uint64_t end, int seek, ondas_shm_direct *out,
+                                      char *error, size_t cap, int *os_error) {
+    *os_error = 0; *out = {};
+    reader->point_ready = false; reader->point_ids.clear();
+    reader->stream.reset(); reader->points.clear(); reader->batch.clear(); reader->position = 0;
+    using Clock = std::chrono::steady_clock;
+    const auto seconds = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double>(b - a).count();
+    };
+    try {
+        if (!count || from > end) return 0;
+        auto started = Clock::now();
+        auto session = std::make_unique<Session>(reader->path);
+        ++reader->work.sessions;
+        const auto declarations = selected_declarations(session->handle, ids, count,
+            reader->declarations, reader->source_nodes, reader->work);
+        out->setup_seconds = seconds(started, Clock::now());
+        Record record{};
+        std::string previous;
+        for (size_t i = 0; i < count; ++i) {
+            const auto &declaration = declarations[i];
+            const bool event = declaration.descriptor.encoding == 4;
+            started = Clock::now();
+            Cursor cursor(declaration.variable);
+            auto opened = Clock::now();
+            out->cursor_seconds += seconds(started, opened);
+            if (seek && from > 0) {
+                const auto sought = da_handle_pl(0x17f, cursor.handle, 0x126, SstTime{from - 1, UINT64_MAX}, 0x10);
+                if (sought > 1) check_handle(sought, "cannot seek SHM history");
+                require(sought == 0 || sought == 1, "invalid SHM seek result");
+                // No record at or before the target: read on from the start.
+                if (!sought) ++out->seek_misses;
+                const auto landed = Clock::now();
+                out->seek_seconds += seconds(opened, landed);
+                opened = landed;
+            }
+            auto current = current_time(cursor);
+            bool available = false, have_previous = false, finished = false;
+            while (!finished && current.tick <= end) {
+                const auto tick = current.tick;
+                bool decoded = false;
+                do {
+                    ++out->records;
+                    const int state = da_get(0x1a3, cursor.handle);
+                    if (!(event && state == 1) && !(state < 0 && !available)) {
+                        available = true;
+                        decode(record, declaration, cursor, current, state);
+                        decoded = true;
+                    }
+                    if (!step(cursor, current, end)) { finished = true; break; }
+                } while (current.tick == tick);
+                if (!decoded) continue;
+                if (tick >= from && (event || !have_previous || record.data != previous)) {
+                    ++out->changes;
+                    out->payload += event ? 8 : record.data.size();
+                }
+                previous = record.data;
+                have_previous = true;
+            }
+            out->read_seconds += seconds(opened, Clock::now());
+        }
         return 0;
     } catch (const std::filesystem::filesystem_error &failure) {
         const auto code = filesystem_failure(failure, os_error, error, cap);

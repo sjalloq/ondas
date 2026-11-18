@@ -586,6 +586,25 @@ pub struct Waveform {
 }
 
 impl Waveform {
+    /// Experimental: reads each signal's history in turn in one SHM session and returns totals.
+    ///
+    /// No value is delivered. With `seek`, each history first seeks to the last record before
+    /// `from`. The function exists to measure the SHM reader without the time-ordered merge.
+    /// A waveform from another backend returns [`Error::Backend`].
+    #[cfg(feature = "shm-lib")]
+    pub fn read_shm_direct(
+        &mut self,
+        signals: &[crate::Signal],
+        from: crate::Time,
+        end: crate::Time,
+        seek: bool,
+    ) -> Result<crate::ShmDirectRead> {
+        let Reader::Shm(reader) = &mut self.reader else {
+            return Err(crate::backends::shm::not_shm());
+        };
+        reader.read_direct(signals, from, end, seek)
+    }
+
     /// Returns the detected source format.
     pub fn format(&self) -> Format {
         match self.reader {

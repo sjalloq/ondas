@@ -522,6 +522,8 @@ pub use time::{Time, TimeRange, TimeSpan, TimeUnit, Timescale};
 /// Owned and borrowed waveform signal values.
 pub use value::{Bits, BitsRef, Logic, Value, ValueRef};
 /// Waveform sources, metadata, formats, and opening functions.
+#[cfg(feature = "shm-lib")]
+pub use backends::shm::ShmDirectRead;
 pub use waveform::{
     Format, Metadata, ShmScopeChild, Waveform, list_shm_scope, open, open_bytes, open_bytes_with,
     open_shm_scopes, open_with, read_metadata,
